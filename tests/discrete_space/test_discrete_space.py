@@ -1370,6 +1370,100 @@ def test_select_random_empty_cell_fallback():
     assert not grid.property_layers["empty"][0, 0]
 
 
+def _fill_grid(grid, model, empty_coords):
+    """Fill every cell of a grid except those in empty_coords; return agents by coordinate."""
+    agents = {}
+    for coord, cell in grid._cells.items():
+        if coord not in empty_coords:
+            agent = CellAgent(model)
+            cell.add_agent(agent)
+            agents[coord] = agent
+    return agents
+
+
+def test_select_random_empty_cell_scan_matches_argwhere():
+    """The vectorized scan must pick the same cell as the original np.argwhere version."""
+    model = Model()
+    grid = OrthogonalMooreGrid((20, 15), torus=False, random=random.Random(7))
+    rng = random.Random(11)
+    empty_coords = {coord for coord in grid._cells if rng.random() < 0.3}
+    _fill_grid(grid, model, empty_coords)
+    grid._try_random = False  # always use the scan
+
+    reference_rng = random.Random(7)
+    for _ in range(25):
+        expected_coords = reference_rng.choice(
+            np.argwhere(grid.property_layers["empty"])
+        )
+        assert grid.select_random_empty_cell().coordinate == tuple(expected_coords)
+
+
+def test_select_random_empty_cell_skips_probing_on_nearly_full_grid():
+    """Once a scan shows the grid is nearly full, random probing is skipped."""
+    model = Model()
+    grid = OrthogonalMooreGrid((50, 50), torus=False, random=random.Random(3))
+    target = (10, 20)
+    agents = _fill_grid(grid, model, {target})
+
+    assert grid.select_random_empty_cell().coordinate == target
+    assert grid._prefer_scan
+
+    # With probing skipped, a call needs exactly one random draw (the pick from the scan)
+    calls = []
+    original_choice = grid.random.choice
+    grid.random.choice = lambda seq: calls.append(1) or original_choice(seq)
+    assert grid.select_random_empty_cell().coordinate == target
+    assert len(calls) == 1
+
+    # Once enough cells are empty again, a scan notices and probing is resumed
+    for coord, agent in list(agents.items())[:1000]:
+        grid._cells[coord].remove_agent(agent)
+    grid.select_random_empty_cell()
+    assert not grid._prefer_scan
+    assert grid.select_random_empty_cell().is_empty
+
+
+def test_select_random_empty_cell_scan_threshold_is_capped_by_count():
+    """On large grids the absolute number of empty cells decides when probing is skipped."""
+    model = Model()
+    grid = OrthogonalMooreGrid((50, 50), torus=False, random=random.Random(2))
+    # instance override: the fraction alone (2% of 2500 cells = 50) would allow a scan
+    grid._SCAN_BELOW_EMPTY_COUNT = 5
+    empty_coords = set(list(grid._cells)[:10])
+    _fill_grid(grid, model, empty_coords)
+
+    grid.select_random_empty_cell()
+    grid._prefer_scan = True  # pretend an earlier scan switched probing off
+    grid.select_random_empty_cell()  # 10 empty cells >= 5, so the scan switches it back on
+    assert not grid._prefer_scan
+
+
+def test_select_random_empty_cell_full_grid_resets_nothing():
+    """A completely full grid still raises and does not break later calls."""
+    model = Model()
+    grid = OrthogonalMooreGrid((5, 5), torus=False, random=random.Random(1))
+    agents = _fill_grid(grid, model, set())
+    with pytest.raises(ValueError, match="Grid is completely full"):
+        grid.select_random_empty_cell()
+
+    grid._cells[(2, 2)].remove_agent(agents[(2, 2)])
+    assert grid.select_random_empty_cell().coordinate == (2, 2)
+
+
+def test_select_random_empty_cell_after_pickle():
+    """The skip-probing state survives (or defaults after) a pickle round trip."""
+    model = Model()
+    grid = OrthogonalMooreGrid((10, 10), torus=False, random=random.Random(5))
+    _fill_grid(grid, model, {(3, 4)})
+    grid.select_random_empty_cell()
+    restored = pickle.loads(pickle.dumps(grid))  # noqa: S301
+    assert restored.select_random_empty_cell().coordinate == (3, 4)
+
+    # grids pickled before the attribute existed fall back to the class default
+    del restored.__dict__["_prefer_scan"]
+    assert restored.select_random_empty_cell().coordinate == (3, 4)
+
+
 def test_fixed_agent_removal_state():
     """Test that a FixedAgent's cell is None after removal."""
     model = Model()

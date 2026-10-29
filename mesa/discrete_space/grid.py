@@ -71,6 +71,16 @@ class Grid(DiscreteSpace[T]):
 
     """
 
+    # Scanning the "empty" property layer is cheaper than randomly probing cells once fewer
+    # than _SCAN_BELOW_EMPTY_COUNT cells are empty (benchmarked on 200x200 and 400x400
+    # grids: the break-even is roughly 1000-2000 empty cells, independent of grid size).
+    # On small grids the fraction is the stricter, and therefore applicable, limit.
+    # See select_random_empty_cell.
+    _SCAN_BELOW_EMPTY_COUNT = 2000
+    _SCAN_BELOW_EMPTY_FRACTION = 0.02
+    # Class-level default so that grids unpickled from older versions still work.
+    _prefer_scan: bool = False
+
     @property
     def width(self) -> int:
         """Convenience access to the width of the grid."""
@@ -296,34 +306,39 @@ class Grid(DiscreteSpace[T]):
             raise TypeError("Capacity must be a number or None.")
 
     def select_random_empty_cell(self) -> T:  # noqa
-        # Use a heuristic: try random sampling first for performance (O(1))
-        # FIXME:: basically if grid is close to 99% full, creating empty list can be faster
-        # FIXME:: note however that the old results don't apply because in this implementation
-        # FIXME:: because empties list needs to be rebuild each time
         # This method is based on Agents.jl's random_empty() implementation. See
         # https://github.com/JuliaDynamics/Agents.jl/pull/541. For the discussion, see
         # https://github.com/mesa/mesa/issues/1052 and
-        # https://github.com/mesa/mesa/pull/1565. The cutoff value provided
-        # is the break-even comparison with the time taken in the else branching point.
+        # https://github.com/mesa/mesa/pull/1565.
+        #
+        # Strategy: probe random cells first, which is O(1) in expectation while the grid is
+        # mostly empty. If the probes fail, scan the "empty" property layer (O(n), but
+        # vectorized). Failed probes are costly on nearly full grids, so once a scan shows
+        # that only a few cells are empty, we skip the probes until a later scan shows the
+        # grid has become less full again.
         random = self.random
         cells = self._celllist
 
-        if self._try_random:
+        if self._try_random and not self._prefer_scan:
             # Limit attempts to avoid infinite loops on full grids
             for _ in range(50):
                 cell = random.choice(cells)
                 if cell.is_empty:
                     return cell
 
-        empty_coords = np.argwhere(self.property_layers["empty"])
-        try:
-            random_coord = self.random.choice(empty_coords)
-        except IndexError as e:
+        # flatnonzero yields indices in the same (row-major) order as np.argwhere, and
+        # self._celllist is built in that same order, so an index maps directly to a cell.
+        empty_idx = np.flatnonzero(self.property_layers["empty"])
+        n_empty = empty_idx.size
+        if n_empty == 0:
             raise ValueError(
                 "Grid is completely full. No empty cells available. "
                 "Cannot select a random empty cell."
-            ) from e
-        return self._cells[tuple(random_coord)]
+            )
+        self._prefer_scan = n_empty < min(
+            self._SCAN_BELOW_EMPTY_COUNT, self._SCAN_BELOW_EMPTY_FRACTION * len(cells)
+        )
+        return cells[random.choice(empty_idx)]
 
     @property
     def cells_with_capacity(self) -> CellCollection[T]:
